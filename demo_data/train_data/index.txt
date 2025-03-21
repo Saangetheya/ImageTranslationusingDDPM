@@ -1,0 +1,3 @@
+041 T1/041_axial_24.png DWI/041_axial_24.png
+041 T1/041_coronal_20.png DWI/041_coronal_20.png
+041 T1/041_sagittal_25.png DWI/041_sagittal_25.png
