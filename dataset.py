@@ -32,7 +32,7 @@ class BrainDataset(Dataset):
         """
         item = self.indices[idx]
         item = item.split(' ')
-        
+
         t1_path = os.path.join(self.data_dir,item[1])
         dwi_path = os.path.join(self.data_dir,item[2])
         subject_id = item[0]
@@ -49,20 +49,20 @@ class BrainDataset(Dataset):
         start_w = (w - min_dim) // 2
         
         # Perform center crop
-        t1_data = t1_data[start_h:start_h + min_dim, start_w:start_w + min_dim]
-        dwi_data = dwi_data[start_h:start_h + min_dim, start_w:start_w + min_dim]
+        t1_data = t1_data[start_h:(start_h + min_dim), start_w:(start_w + min_dim)]
+        dwi_data = dwi_data[start_h:(start_h + min_dim), start_w:(start_w + min_dim)]
         
         # Resize to 64x64
         t1_data = cv2.resize(t1_data, (64, 64), interpolation=cv2.INTER_LINEAR)
         dwi_data = cv2.resize(dwi_data, (64, 64), interpolation=cv2.INTER_LINEAR)
 
-        t1_data = torch.from_numpy(t1_data).float()
-        dwi_data = torch.from_numpy(dwi_data).float()
+        t1_data = 1 - torch.from_numpy(t1_data).float() / 255.0
+        dwi_data = 1 - torch.from_numpy(dwi_data).float() / 255.0
 
         if len(t1_data.shape) == 2:
-            t1_data = t1_data.unsqueeze(0)
+            t1_data = t1_data.unsqueeze(0) * 2 - 1
         if len(dwi_data.shape) == 2:
-            dwi_data = dwi_data.unsqueeze(0)
+            dwi_data = dwi_data.unsqueeze(0) * 2 - 1
         
         return {
             'T1': t1_data,

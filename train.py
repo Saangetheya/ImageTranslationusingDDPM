@@ -19,7 +19,7 @@ from packaging import version
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMScheduler, UNet2DModel
+from diffusers import DDPMScheduler, UNet2DModel, DDPMPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -579,9 +579,10 @@ def main(args):
                     start_w = (w - min_dim) // 2
                     
                     # Perform center crop
-                    t1_image = t1_image[start_h:start_h + min_dim, start_w:start_w + min_dim]
+                    t1_image = t1_image[start_h:(start_h + min_dim), start_w:(start_w + min_dim)]
                     t1_image = cv2.resize(t1_image, (64, 64), interpolation=cv2.INTER_LINEAR)
-                    t1_image = torch.from_numpy(t1_image).float().unsqueeze(0).unsqueeze(0)
+                    t1_image = (1 - torch.from_numpy(t1_image).float().unsqueeze(0).unsqueeze(0) / 255.) * 2 - 1.
+
                     t1_image = t1_image.to(device=accelerator.device, dtype=weight_dtype)
                     images = pipeline(
                         t1_image,
@@ -596,6 +597,7 @@ def main(args):
 
                     # denormalize the images and save to tensorboard
                     images_processed = (images * 255).round().astype("uint8")
+                    # print(images_processed.shape)
 
                     if args.logger == "tensorboard":
                         if is_accelerate_version(">=", "0.17.0.dev0"):

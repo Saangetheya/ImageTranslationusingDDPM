@@ -79,6 +79,9 @@ class MRIsDDPMPipeline(DiffusionPipeline):
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
+        # print(self.scheduler.timesteps)
+        # model_input = self.scheduler.add_noise(t1_image, image, 499 * torch.ones(batch_size, device=self.device, dtype=torch.long))
+        # print(model_input.shape, t1_image.shape, image.shape)
 
         for t in self.progress_bar(self.scheduler.timesteps):
             # 1. predict noise model_output
