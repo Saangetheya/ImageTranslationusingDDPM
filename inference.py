@@ -48,7 +48,7 @@ fid_metric = piq.FID().to(device)
 
 with open(os.path.join(output_dir, "result.txt"), "w") as f:
     for i, t1_image in enumerate(t1_images):
-        image = pipeline(t1_image.to(device), batch_size=1, num_inference_steps=200, output_type="np").images
+        image = pipeline(t1_image.to(device), batch_size=1, num_inference_steps=1000, output_type="np").images
         image_processed = ((1-image) * 255).round().astype("uint8")[0, ..., 0]
 
         image_combine = np.concatenate([t1_images_ori_np[i], dwi_images_ori_np[i], image_processed], axis=1)

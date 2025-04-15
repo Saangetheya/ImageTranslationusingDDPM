@@ -19,7 +19,7 @@ from packaging import version
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMScheduler, UNet2DModel, DDPMPipeline
+from diffusers import DDPMScheduler#, UNet2DModel, DDPMPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -27,7 +27,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from dataset import BrainDataset
 from pipeline import MRIsDDPMPipeline
-
+from model.unet_2d import UNet2DModel
 
 logger = get_logger(__name__, log_level="INFO")
 
