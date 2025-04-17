@@ -307,9 +307,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
 
         # 2. pre-process
         skip_sample = sample
-        print("Before conv_in: ", sample.shape)
         sample = self.conv_in(sample)
-        print("After conv_in: ", sample.shape)
 
         # 3. down
         down_block_res_samples = (sample,)
@@ -320,13 +318,11 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 )
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-            print(f"Downsample block {i} samples shape: {sample.shape}")
 
             down_block_res_samples += res_samples
 
         # 4. mid
         sample = self.mid_block(sample, emb)
-        print(f"Mid block samples shape: {sample.shape}")
         # 5. up
         skip_sample = None
         for i, upsample_block in enumerate(self.up_blocks):
@@ -337,13 +333,11 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 sample, skip_sample = upsample_block(sample, res_samples, emb, skip_sample)
             else:
                 sample = upsample_block(sample, res_samples, emb)
-            print(f"Upsample block {i} samples shape: {sample.shape}")
 
         # 6. post-process
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
         sample = self.conv_out(sample)
-        print(f"After conv_out: {sample.shape}")
 
         if skip_sample is not None:
             sample += skip_sample

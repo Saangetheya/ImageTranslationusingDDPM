@@ -67,5 +67,5 @@ class BrainDataset(Dataset):
         return {
             'T1': t1_data,
             'DWI': dwi_data,
-            'subject_id': subject_id
+            'subject_id': int(subject_id)
         }
