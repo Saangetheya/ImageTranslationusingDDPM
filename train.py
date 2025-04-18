@@ -220,13 +220,13 @@ def parse_args():
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument(
-        "--num_classes", type=int, default=1, help="The number of subject classes to use for the model."
+        "--num_classes", type=int, default=1, help="The number of diagnosis classes to use for the model."
     )
     parser.add_argument(
         "--class_embed_type", type=str, default="timestep", help="The type of class embedding to use for the model."
     )
     parser.add_argument(
-        "--val_data_class", type=int, default=0, help="The class of the validation data."
+        "--val_data_diagnosis", type=int, default=0, help="The diagnosis of the validation data."
     )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -480,7 +480,7 @@ def main(args):
 
             clean_images = batch["DWI"].to(weight_dtype)
             conditional_images = batch["T1"].to(weight_dtype)
-            subject_ids = batch["subject_id"].to(weight_dtype)
+            diagnosis_ids = batch["diagnosis"].to(weight_dtype)
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
             bsz = clean_images.shape[0]
@@ -496,7 +496,7 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                model_output = model(noisy_images, timesteps, class_labels=subject_ids).sample
+                model_output = model(noisy_images, timesteps, class_labels=diagnosis_ids).sample
 
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
@@ -597,7 +597,7 @@ def main(args):
                     t1_image = t1_image.to(device=accelerator.device, dtype=weight_dtype)
                     images = pipeline(
                         t1_image,
-                        subject_id=torch.tensor([args.val_data_class], device=accelerator.device),
+                        diagnosis_id=torch.tensor([args.val_data_diagnosis], device=accelerator.device),
                         generator=generator,
                         batch_size=args.eval_batch_size,
                         num_inference_steps=args.ddpm_num_inference_steps,

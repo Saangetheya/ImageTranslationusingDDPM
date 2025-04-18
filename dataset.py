@@ -3,6 +3,7 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 import numpy as np
+import random
 
 class BrainDataset(Dataset):
     def __init__(self, data_dir):
@@ -35,7 +36,7 @@ class BrainDataset(Dataset):
 
         t1_path = os.path.join(self.data_dir,item[1])
         dwi_path = os.path.join(self.data_dir,item[2])
-        subject_id = item[0]
+        diagnosis = random.randint(0, 2)
         
         t1_data = cv2.imread(t1_path, cv2.IMREAD_GRAYSCALE)
         dwi_data = cv2.imread(dwi_path, cv2.IMREAD_GRAYSCALE)
@@ -67,5 +68,5 @@ class BrainDataset(Dataset):
         return {
             'T1': t1_data,
             'DWI': dwi_data,
-            'subject_id': int(subject_id)
+            'diagnosis': diagnosis
         }

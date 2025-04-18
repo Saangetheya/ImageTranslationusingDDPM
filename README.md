@@ -19,15 +19,15 @@ accelerate launch train.py \
 ```
 
 Training with subject ids, need to specify:
-- ```TOTAL_NUM_SUBJECTS```: the total number of subjects
-- ```VALIDATION_CLASS```: the subject id class for validation
+- ```TOTAL_NUM_DIAGNOSIS_CLASS```: the total number of diagnosis classes (currently 3)
+- ```VALIDATION_DIAGNOSIS_CLASS```: the diagnosis id class for validation (currently choice from 0, 1, 2)
 ```bash
 accelerate launch train.py \
     --train_data_dir demo_data/train_data \
     --val_data_dir demo_data/eval_data \
     --output_dir YOUR_OUTPUT_DIR \
-    --num_classes TOTAL_NUM_SUBJECTS \
-    --val_data_class VALIDATION_CLASS
+    --num_classes TOTAL_NUM_DIAGNOSIS_CLASS \
+    --val_data_class VALIDATION_DIAGNOSIS_CLASS
 ```
 
 ### About 3D UNet / Spatial-Temporal UNet

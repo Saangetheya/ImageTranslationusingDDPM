@@ -31,7 +31,7 @@ class MRIsDDPMPipeline(DiffusionPipeline):
     def __call__(
         self,
         t1_image: torch.Tensor,
-        subject_id: torch.Tensor,
+        diagnosis_id: torch.Tensor,
         batch_size: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         num_inference_steps: int = 1000,
@@ -87,7 +87,7 @@ class MRIsDDPMPipeline(DiffusionPipeline):
         for t in self.progress_bar(self.scheduler.timesteps):
             # 1. predict noise model_output
             model_input = torch.cat([image, t1_image], dim=1)
-            model_output = self.unet(model_input, t, class_labels=subject_id).sample
+            model_output = self.unet(model_input, t, class_labels=diagnosis_id).sample
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
