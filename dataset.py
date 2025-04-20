@@ -40,6 +40,7 @@ class MonaiMRIDataset(Dataset):
         with open(os.path.join(root_dir, index_file), 'r') as f:
             self.file_paths = [line.strip() for line in f if line.strip()]
         
+        self.root_dir = root_dir
         self.image_size = image_size
         
     def __len__(self):
@@ -47,8 +48,9 @@ class MonaiMRIDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.file_paths[idx]
-        t1_image_path = os.path.join(self.root_dir, item[1])
-        dwi_image_path = os.path.join(self.root_dir, item[2])
+        item = item.split(" ")
+        t1_image_path = os.path.join(self.root_dir, item[0])
+        dwi_image_path = os.path.join(self.root_dir, item[1])
 
         t1_image = load_data(t1_image_path)
         dwi_image = load_data(dwi_image_path)
@@ -56,6 +58,18 @@ class MonaiMRIDataset(Dataset):
         t1_image = resize_3d(t1_image, self.image_size)
         dwi_image = resize_3d(dwi_image, self.image_size)
 
+        t1_image = torch.from_numpy(t1_image).unsqueeze(0)
+        dwi_image = torch.from_numpy(dwi_image).unsqueeze(0)
+
         diagnosis = random.randint(0, 2)
 
         return {"t1_image": t1_image, "dwi_image": dwi_image, "diagnosis": diagnosis}
+
+
+if __name__ == "__main__":
+    dataset = MonaiMRIDataset("./demo_data", "train_index.txt", (32, 40, 32))
+    print(len(dataset))
+    item = dataset[0]
+    print(item['t1_image'].shape)
+    print(item['dwi_image'].shape)
+    print(item['diagnosis'])
