@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from monai.apps import DecathlonDataset
-from monai.config import print_config
 from monai.data import DataLoader
 from monai.transforms import (
     EnsureChannelFirstd,
@@ -26,6 +25,8 @@ from generative.inferers import DiffusionInferer
 from generative.networks.nets import DiffusionModelUNet
 from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 
+from dataset import MonaiMRIDataset
+
 model = DiffusionModelUNet(
     spatial_dims=3,
     in_channels=2,
@@ -38,6 +39,15 @@ model = DiffusionModelUNet(
 
 device = torch.device("cuda")
 model.to(device)
+set_determinism(42)
+
+data_root_dir = "/wekafs/ict/wenbinte/data/MRIs/raw"
+
+train_dataset = MonaiMRIDataset(data_root_dir, "train_index.txt", (32, 40, 32))
+val_dataset = MonaiMRIDataset(data_root_dir, "val_index.txt", (32, 40, 32))
+
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
 scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0005, beta_end=0.0195)
 
@@ -64,17 +74,15 @@ for epoch in range(n_epochs):
 
         with autocast(enabled=True):
             # Generate random noise
-            noise = torch.randn_like(t1_images).to(device)
+            noise = torch.randn_like(dwi_images).to(device)
 
             # Create timesteps
             timesteps = torch.randint(
-                0, inferer.scheduler.num_train_timesteps, (t1_images.shape[0],), device=t1_images.device
+                0, inferer.scheduler.num_train_timesteps, (dwi_images.shape[0],), device=dwi_images.device
             ).long()
 
-            
-
             # Get model prediction
-            noise_pred = inferer(inputs=images, diffusion_model=model, noise=noise, timesteps=timesteps)
+            noise_pred = inferer(inputs=dwi_images, diffusion_model=model, noise=noise, timesteps=timesteps, condition=t1_images, mode="concat")
 
             loss = F.mse_loss(noise_pred.float(), noise.float())
 
@@ -91,16 +99,17 @@ for epoch in range(n_epochs):
         model.eval()
         val_epoch_loss = 0
         for step, batch in enumerate(val_loader):
-            images = batch["image"].to(device)
-            noise = torch.randn_like(images).to(device)
+            t1_images = batch["t1_image"].to(device)
+            dwi_images = batch["dwi_image"].to(device)
+            noise = torch.randn_like(dwi_images).to(device)
             with torch.no_grad():
                 with autocast(enabled=True):
                     timesteps = torch.randint(
-                        0, inferer.scheduler.num_train_timesteps, (images.shape[0],), device=images.device
+                        0, inferer.scheduler.num_train_timesteps, (dwi_images.shape[0],), device=dwi_images.device
                     ).long()
 
                     # Get model prediction
-                    noise_pred = inferer(inputs=images, diffusion_model=model, noise=noise, timesteps=timesteps)
+                    noise_pred = inferer(inputs=dwi_images, diffusion_model=model, noise=noise, timesteps=timesteps, condition=t1_images, mode="concat")
                     val_loss = F.mse_loss(noise_pred.float(), noise.float())
 
             val_epoch_loss += val_loss.item()
@@ -119,14 +128,3 @@ for epoch in range(n_epochs):
         plt.tight_layout()
         plt.axis("off")
         plt.show()
-
-total_time = time.time() - total_start
-print(f"train completed, total time: {total_time}.")
-
-
-# Sampling
-model.eval()
-noise = torch.randn((1, 1, 32, 40, 32))
-noise = noise.to(device)
-scheduler.set_timesteps(num_inference_steps=1000)
-image = inferer.sample(input_noise=noise, diffusion_model=model, scheduler=scheduler)
