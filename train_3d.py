@@ -1,0 +1,647 @@
+import argparse
+import inspect
+import logging
+import math
+import os
+import shutil
+from datetime import timedelta
+from pathlib import Path
+import cv2
+
+import accelerate
+import datasets
+import torch
+import torch.nn.functional as F
+from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration
+from packaging import version
+from tqdm.auto import tqdm
+
+import diffusers
+from diffusers import DDPMScheduler
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel
+from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
+from diffusers.utils.import_utils import is_xformers_available
+
+# Import 3D version classes
+from dataset import Brain3DDataset
+from pipeline_3d import MRIs3DDDPMPipeline
+from model.unet_3d import UNet3DModel
+
+# Check if MPS is available and set device
+device = torch.device("cpu")
+print("Using CPU")
+
+logger = get_logger(__name__, log_level="INFO")
+
+
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+
+    :param arr: the 1-D numpy array.
+    :param timesteps: a tensor of indices into the array to extract.
+    :param broadcast_shape: a larger shape of K dimensions with the batch
+                            dimension equal to the length of timesteps.
+    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+    """
+    if not isinstance(arr, torch.Tensor):
+        arr = torch.from_numpy(arr)
+    res = arr[timesteps].float().to(timesteps.device)
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res.expand(broadcast_shape)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Training script for 3D DDPM with temporal information.")
+    parser.add_argument(
+        "--model_config_name_or_path",
+        type=str,
+        default=None,
+        help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
+    )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        default=None,
+        help="The directory containing the training data.",
+    )
+    parser.add_argument(
+        "--val_data_dir",
+        type=str,
+        default=None,
+        help="The directory containing the validation data.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="ddpm-model-3d-64",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument("--overwrite_output_dir", action="store_true")
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=64,
+        help=(
+            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+            " resolution"
+        ),
+    )
+    parser.add_argument(
+        "--temporal_length",
+        type=int,
+        default=5,
+        help="The number of consecutive slices to use for the temporal dimension",
+    )
+    parser.add_argument(
+        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument(
+        "--eval_batch_size", type=int, default=4, help="The number of images to generate for evaluation."
+    )
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "The number of subprocesses to use for data loading. 0 means that the data will be loaded in the main"
+            " process."
+        ),
+    )
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
+    parser.add_argument(
+        "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="cosine",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+    )
+    parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument(
+        "--adam_weight_decay", type=float, default=1e-6, help="Weight decay magnitude for the Adam optimizer."
+    )
+    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer.")
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Whether to use Exponential Moving Average for the final model weights.",
+    )
+    parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
+    parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
+    parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
+
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+        help=(
+            "Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) or [wandb](https://www.wandb.ai)"
+            " for experiment tracking and logging of model metrics and model checkpoints"
+        ),
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help=(
+            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+        ),
+    )
+    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="no",
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose"
+            "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+            "and an Nvidia Ampere GPU."
+        ),
+    )
+    parser.add_argument(
+        "--prediction_type",
+        type=str,
+        default="epsilon",
+        choices=["epsilon", "sample"],
+        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
+    )
+    parser.add_argument("--ddpm_num_steps", type=int, default=1000)
+    parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
+    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help=("Max number of checkpoints to store."),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+    )
+
+    args = parser.parse_args()
+    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if env_local_rank != -1 and env_local_rank != args.local_rank:
+        args.local_rank = env_local_rank
+
+    return args
+
+
+def main(args):
+    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+
+    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))  # a big number for high resolution or big dataset
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        # No GPU
+        # mixed_precision=args.mixed_precision,
+        mixed_precision="no",
+        log_with=args.logger,
+        project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs],
+        # No GPU
+        device_placement=False,
+    )
+
+    if args.logger == "tensorboard":
+        if not is_tensorboard_available():
+            raise ImportError("Make sure to install tensorboard if you want to use it for logging during training.")
+
+    elif args.logger == "wandb":
+        if not is_wandb_available():
+            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+        import wandb
+
+    # `accelerate` 0.16.0 will have better support for customized saving
+    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        def save_model_hook(models, weights, output_dir):
+            if accelerator.is_main_process:
+                if args.use_ema:
+                    ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
+
+                for i, model in enumerate(models):
+                    model.save_pretrained(os.path.join(output_dir, "unet"))
+
+                    # make sure to pop weight so that corresponding model is not saved again
+                    weights.pop()
+
+        def load_model_hook(models, input_dir):
+            if args.use_ema:
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet3DModel)
+                ema_model.load_state_dict(load_model.state_dict())
+                ema_model.to(accelerator.device)
+                del load_model
+
+            for i in range(len(models)):
+                # pop models so that they are not loaded again
+                model = models.pop()
+
+                # load diffusers style into model
+                load_model = UNet3DModel.from_pretrained(input_dir, subfolder="unet")
+                model.register_to_config(**load_model.config)
+
+                model.load_state_dict(load_model.state_dict())
+                del load_model
+
+        accelerator.register_save_state_pre_hook(save_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
+
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        datasets.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+
+    # Initialize the 3D model
+    if args.model_config_name_or_path is None:
+        model = UNet3DModel(
+            sample_size=args.resolution,
+            in_channels=2,  # 1 channel for noise + 1 channel for condition
+            out_channels=1,  # 1 channel for output (DWI)
+            layers_per_block=2,
+            block_out_channels=(128, 128, 256, 256, 512, 512),
+            down_block_types=(
+                "DownBlock3D",
+                "DownBlock3D",
+                "DownBlock3D",
+                "DownBlock3D",
+                "DownBlock3D",
+                "DownBlock3D",
+            ),
+            up_block_types=(
+                "UpBlock3D",
+                "UpBlock3D",
+                "UpBlock3D",
+                "UpBlock3D",
+                "UpBlock3D",
+                "UpBlock3D",
+            ),
+            # 3D specific parameters
+            temporal_length=args.temporal_length,
+        )
+    else:
+        config = UNet3DModel.load_config(args.model_config_name_or_path)
+        model = UNet3DModel.from_config(config)
+
+    # Create EMA for the model
+    if args.use_ema:
+        ema_model = EMAModel(
+            model.parameters(),
+            decay=args.ema_max_decay,
+            use_ema_warmup=True,
+            inv_gamma=args.ema_inv_gamma,
+            power=args.ema_power,
+            model_cls=UNet3DModel,
+            model_config=model.config,
+        )
+
+    # Set weight data type
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+        args.mixed_precision = accelerator.mixed_precision
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        args.mixed_precision = accelerator.mixed_precision
+
+    # Set up xformers (optional)
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            import xformers
+
+            xformers_version = version.parse(xformers.__version__)
+            if xformers_version == version.parse("0.0.16"):
+                logger.warning(
+                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                )
+            model.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    # Initialize scheduler
+    accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+    if accepts_prediction_type:
+        noise_scheduler = DDPMScheduler(
+            num_train_timesteps=args.ddpm_num_steps,
+            beta_schedule=args.ddpm_beta_schedule,
+            prediction_type=args.prediction_type,
+        )
+    else:
+        noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
+
+    # Initialize optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    # Get dataset
+    dataset = Brain3DDataset(args.train_data_dir, temporal_length=args.temporal_length)
+
+    train_dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+    )
+
+    # Initialize learning rate scheduler
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=(len(train_dataloader) * args.num_epochs),
+    )
+
+    # Prepare everything with accelerator
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
+
+    if args.use_ema:
+        ema_model.to(accelerator.device)
+
+    # Initialize trackers
+    if accelerator.is_main_process:
+        run = os.path.split(__file__)[-1].split(".")[0]
+        accelerator.init_trackers(run)
+
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    max_train_steps = args.num_epochs * num_update_steps_per_epoch
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(dataset)}")
+    logger.info(f"  Num Epochs = {args.num_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {max_train_steps}")
+
+    global_step = 0
+    first_epoch = 0
+
+    # Resume training from checkpoint (if needed)
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the latest checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            args.resume_from_checkpoint = None
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            global_step = int(path.split("-")[1])
+
+            resume_global_step = global_step * args.gradient_accumulation_steps
+            first_epoch = global_step // num_update_steps_per_epoch
+            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+
+    # Training loop
+    for epoch in range(first_epoch, args.num_epochs):
+        model.train()
+        progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
+        progress_bar.set_description(f"Epoch {epoch}")
+        for step, batch in enumerate(train_dataloader):
+            # If resuming from checkpoint, skip completed steps
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % args.gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                continue
+
+            clean_images = batch["DWI"].to(weight_dtype)
+            conditional_images = batch["T1"].to(weight_dtype)
+
+            # Add noise
+            noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
+            bsz = clean_images.shape[0]
+
+            # Sample random timesteps for each image
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+            ).long()
+
+            # Add noise to clean images based on noise level at each timestep
+            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            noisy_images = torch.cat([noisy_images, conditional_images], dim=1)
+
+            with accelerator.accumulate(model):
+                # Predict noise residual
+                model_output = model(noisy_images, timesteps).sample
+
+                if args.prediction_type == "epsilon":
+                    loss = F.mse_loss(model_output.float(), noise.float())  # Noise prediction loss
+                elif args.prediction_type == "sample":
+                    alpha_t = _extract_into_tensor(
+                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1, 1)
+                    )
+                    snr_weights = alpha_t / (1 - alpha_t)
+                    # Use SNR weights from distillation paper
+                    loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
+                    loss = loss.mean()
+                else:
+                    raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Check if accelerator has performed optimization step in the background
+            if accelerator.sync_gradients:
+                if args.use_ema:
+                    ema_model.step(model.parameters())
+                progress_bar.update(1)
+                global_step += 1
+
+                if accelerator.is_main_process:
+                    if global_step % args.checkpointing_steps == 0:
+                        # Before saving state, check if it will exceed `checkpoints_total_limit`
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                            # Before saving a new checkpoint, we should have at most `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            if args.use_ema:
+                logs["ema_decay"] = ema_model.cur_decay_value
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+        progress_bar.close()
+
+        accelerator.wait_for_everyone()
+
+        # Generate sample images for evaluation
+        if accelerator.is_main_process:
+            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+                unet = accelerator.unwrap_model(model)
+
+                if args.use_ema:
+                    ema_model.store(unet.parameters())
+                    ema_model.copy_to(unet.parameters())
+
+                pipeline = MRIs3DDDPMPipeline(
+                    unet=unet,
+                    scheduler=noise_scheduler,
+                )
+
+                generator = torch.Generator(device=pipeline.device).manual_seed(0)
+
+                # Load validation data
+                eval_dataset = Brain3DDataset(args.val_data_dir, temporal_length=args.temporal_length)
+                eval_dataloader = torch.utils.data.DataLoader(
+                    eval_dataset, batch_size=1, shuffle=False
+                )
+
+                # Generate some evaluation samples
+                for eval_batch in eval_dataloader:
+                    t1_volume = eval_batch["T1"].to(weight_dtype).to(pipeline.device)
+
+                    # Run inference
+                    volumes = pipeline(
+                        t1_volume,
+                        generator=generator,
+                        batch_size=1,
+                        num_inference_steps=args.ddpm_num_inference_steps,
+                        output_type="np",
+                    ).images
+
+                    # Save generated volumes
+                    save_dir = os.path.join(args.output_dir, f"samples/epoch-{epoch}")
+                    os.makedirs(save_dir, exist_ok=True)
+
+                    subject_id = eval_batch["subject_id"][0]
+                    pipeline.save_volume(
+                        volumes,
+                        save_dir,
+                        file_prefix=f"{subject_id}_dwi_slice"
+                    )
+
+                    # Only generate a few samples
+                    break
+
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+
+                # Save model
+                if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+                    # Save model
+                    unet = accelerator.unwrap_model(model)
+
+                    if args.use_ema:
+                        ema_model.store(unet.parameters())
+                        ema_model.copy_to(unet.parameters())
+
+                    pipeline = MRIs3DDDPMPipeline(
+                        unet=unet,
+                        scheduler=noise_scheduler,
+                    )
+
+                    pipeline.save_pretrained(args.output_dir)
+
+                    if args.use_ema:
+                        ema_model.restore(unet.parameters())
+
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)

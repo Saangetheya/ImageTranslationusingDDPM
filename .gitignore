@@ -1,0 +1,23 @@
+# 输出目录
+YOUR_OUTPUT_DIR/
+
+# 模型文件
+*.bin
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+
+# 数据文件
+*.nii.gz
+raw_data_folder/
+
+# 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# 日志
+logs/
+*.log
