@@ -61,7 +61,7 @@ class MonaiMRIDataset(Dataset):
         t1_image = torch.from_numpy(t1_image).unsqueeze(0)
         dwi_image = torch.from_numpy(dwi_image).unsqueeze(0)
 
-        diagnosis = random.randint(0, 2)
+        diagnosis = torch.tensor(random.randint(0, 2)).long()
 
         return {"t1_image": t1_image, "dwi_image": dwi_image, "diagnosis": diagnosis}
 
