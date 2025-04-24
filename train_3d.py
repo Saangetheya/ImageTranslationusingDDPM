@@ -32,7 +32,7 @@ from model.unet_3d import UNet3DModel
 
 # Check if MPS is available and set device
 device = torch.device("cpu")
-print("Using CPU")
+print(f"Using {device}")
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -231,6 +231,13 @@ def parse_args():
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
 
+    parser.add_argument(
+        "--val_data_diagnosis",
+        type=int,
+        default=0,
+        help="Diagnosis ID to use for validation",
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -343,6 +350,8 @@ def main(args):
                 "UpBlock3D",
                 "UpBlock3D",
             ),
+            # Add class embedding parameters
+            num_class_embeds=3,
             # 3D specific parameters
             temporal_length=args.temporal_length,
         )
@@ -487,6 +496,8 @@ def main(args):
 
             clean_images = batch["DWI"].to(weight_dtype)
             conditional_images = batch["T1"].to(weight_dtype)
+            # 将 diagnosis_ids 转换为 long 类型
+            diagnosis_ids = batch["diagnosis"].long().to(device)
 
             # Add noise
             noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
@@ -503,7 +514,7 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict noise residual
-                model_output = model(noisy_images, timesteps).sample
+                model_output = model(noisy_images, timesteps, class_labels=diagnosis_ids).sample
 
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output.float(), noise.float())  # Noise prediction loss
@@ -597,6 +608,7 @@ def main(args):
                     # Run inference
                     volumes = pipeline(
                         t1_volume,
+                        diagnosis_id=torch.tensor([args.val_data_diagnosis], device=accelerator.device),
                         generator=generator,
                         batch_size=1,
                         num_inference_steps=args.ddpm_num_inference_steps,

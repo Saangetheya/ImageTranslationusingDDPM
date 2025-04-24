@@ -1,3 +1,0 @@
-Generated: 041_axial_seq0_slice0.png
-Generated: 041_axial_seq0_slice1.png
-Generated: 041_axial_seq0_slice2.png
